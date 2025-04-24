@@ -64,3 +64,7 @@ pools mostly from one state held longer?).
 Puerto Rico focus: Investigate Puerto Rico’s role as an outlier – it’s
 not a state, but the Fed held some PR loans. Does it sit apart in the
 network, and how long did those loans stay on the Fed’s books?
+
+**NOTE**
+
+All .py files are for the initial data extraction process. In other words, if you are reading this **Professor Diaz Eaton** feel free to skip over those unless you are curious!
