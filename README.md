@@ -1,4 +1,3 @@
-
 # Fed_FHLMC_MBS
 
 Unpacking the Fed’s Mortgage Network When the U.S. Federal Reserve buys
@@ -120,6 +119,7 @@ summary(clean$HoldingDays)
 #   Min. 1st Qu. Median  Mean 3rd Qu.   Max.  NA's
 #      0     616    721 1201   1372  5019  5096
 ```
+<img width="338" alt="Screen Shot 2025-04-24 at 1 48 11 PM" src="https://github.com/user-attachments/assets/02c40299-243a-483d-bd9a-52154a295617" />
 
 ![download-2](https://github.com/user-attachments/assets/e1688528-c1fb-4036-9bba-f09f39937df2)
 3. Concentrated vs Diverse Network Views
