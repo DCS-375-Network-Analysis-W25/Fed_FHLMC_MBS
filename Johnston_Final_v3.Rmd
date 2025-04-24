@@ -1,0 +1,611 @@
+---
+title: "Johnston_final"
+author: "Bea Johnston"
+date: "2025-04-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#store string containing all required packages
+my_packages <- c('rtweet', 'ggplot2', 'igraph', 'RColorBrewer', 'readr', 'bipartite')
+```
+
+Figure out which of these packages is already installed
+``` {r, message=F, warning=F}
+# Store all installed packages
+ya_installed <- library()$results[,1]
+
+# Check whether required packages are already installed and grab only those that still need installation
+need_install<-my_packages[!(my_packages %in% ya_installed)]
+
+#install required packages
+lapply({need_install}, install.packages, character.only = TRUE)
+
+```
+
+
+``` {r, message=F, warning=F}
+# Store all installed packages
+ya_loaded <- (.packages())
+
+# Check whether required packages are already installed and grab only those that still need installation
+need_load<-my_packages[!(my_packages %in% ya_loaded)]
+
+# Load required packages
+lapply(need_load, require, character.only = TRUE)
+
+#also load the readr library
+library(readr)
+library(bipartite)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(igraph)
+library(reshape2)
+
+```
+Our data comes from the Fed’s MBS purchase records. Each observation corresponds to a security the Fed purchased, including: the CUSIP identifier, purchase date, sale date (if sold), and the breakdown of the underlying mortgage principal across U.S. states and territories (in dollars). For example, a row might indicate the Fed bought Security X on 2010-05-15, with 30% of its mortgages from California, 10% from Florida, 5% from New York, etc. First, we load and clean the data (e.g., converting strings to dates and numbers). We compute each MBS’s total HoldingDays (sale date – purchase date). Then we reshape the state columns from wide to long format for analysis: each security becomes multiple records like (CUSIP, State, principal% of that MBS). Here’s a glimpse after cleaning:
+```{r}
+# Load data (all columns read as characters initially)
+data <- read_csv("org_full_time_series.csv", col_types = cols(.default = col_character()))
+
+data <- data %>% select(-c(228,229,230,231))
+
+# Convert numeric columns (e.g., UPB, face values, etc.) by removing "$" and ","
+numeric_cols <- names(data)[7:ncol(data)]  # assuming numeric data start from column 7
+data[numeric_cols] <- data[numeric_cols] %>% 
+  mutate(across(everything(), ~parse_number(.)))
+
+# Merge duplicate DC columns if present
+if("District Of Columbia_Aggregate_UPB" %in% names(data)) {
+  data <- data %>%
+    mutate(`District of Columbia_Aggregate_UPB` = coalesce(`District of Columbia_Aggregate_UPB`, `District Of Columbia_Aggregate_UPB`),
+           `District of Columbia_Percent_UPB` = coalesce(`District of Columbia_Percent_UPB`, `District Of Columbia_Percent_UPB`),
+           `District of Columbia_Number_of_Loans` = coalesce(`District of Columbia_Number_of_Loans`, `District Of Columbia_Number_of_Loans`),
+           `District of Columbia_Percent_Loans` = coalesce(`District of Columbia_Percent_Loans`, `District Of Columbia_Percent_Loans`)) %>%
+    select(-starts_with("District Of Columbia_"))
+}
+
+# Convert date columns to Date type
+data <- data %>%
+  mutate(`Purchase Date` = as.Date(`Purchase Date`),
+         `Sale Date` = as.Date(`Sale Date`))
+         
+# Create HoldingDays variable (difference between Sale Date and Purchase Date)
+data_filtered <- data %>% mutate(HoldingDays = as.numeric(`Sale Date` - `Purchase Date`))
+
+# Peek at the data structure
+glimpse(data)
+
+```
+
+```{r}
+#data_filtered <- data %>%
+#  filter(year(`Purchase Date`) %in% c(2009:2012, 2019:2022))
+```
+
+There are 31,713 securities (CUSIPs) the Fed engaged with from 2009 to 2023. Each has columns for every state’s percentage of the total principal (“Percent_UPB”). For instance, Puerto Rico_Percent_UPB might be 0.89 for one security (meaning 0.89% of its mortgages are Puerto Rican). Many of these percentages are zero for a given state (not all pools include all states). We convert these to a long table of (CUSIP, State, percent) for network building. We also flag each security as “Concentrated” if any one state makes up >50% of its pool (versus “Diverse”). This will help see if highly localized pools behave differently.
+```{r}
+# Reshape state-level UPB columns to long format
+state_upb_long <- data_filtered %>%
+  select(CUSIP, `Purchase Date`, ends_with("_Aggregate_UPB")) %>%
+  pivot_longer(
+    cols = ends_with("_Aggregate_UPB"),
+    names_to = "State",
+    names_pattern = "(.*)_Aggregate_UPB",
+    values_to = "UPB"
+  ) %>%
+  mutate(UPB = as.numeric(UPB),
+         Year = year(`Purchase Date`)) %>%
+  filter(!is.na(Year))
+
+# Compute total UPB per CUSIP (summing across all states)
+cusip_totals <- state_upb_long %>%
+  group_by(CUSIP) %>%
+  summarize(Total_UPB = sum(UPB, na.rm = TRUE), .groups = "drop")
+
+# Merge total UPB back and calculate percentage per state
+cusip_composition <- state_upb_long %>%
+  left_join(cusip_totals, by = "CUSIP") %>%
+  mutate(Percent_State_UPB = if_else(Total_UPB > 0, 100 * UPB / Total_UPB, 0))
+
+```
+
+
+```{r}
+
+state_year <- state_upb_long %>%
+  group_by(Year, State) %>%
+  summarize(Total_UPB = sum(UPB, na.rm=TRUE), .groups="drop")
+
+
+# Identify top 5 states by total UPB across all years
+top_states <- state_year %>%
+  group_by(State) %>%
+  summarize(Overall_UPB = sum(Total_UPB)) %>%
+  arrange(desc(Overall_UPB)) %>%
+  slice_head(n=5) %>%
+  pull(State)
+top_states
+
+```
+The top five states by total Fed-purchased principal were California, Illinois, Texas, New York, and Florida. These are large states with big housing markets, so it makes sense. California in particular stands out as a mega-hub, with a huge share of Fed-supported mortgages. In network terms, California is a high-degree node connecting to many others​ The chart below plots each year’s purchased principal for all states (faceted) and highlights the top 5 states over time:
+Total UPB by State, 2009–2023. Each panel is a year; within a panel states are sorted by total principal the Fed bought that year. California (the long light-blue bars in many years) consistently dominates. Peaks correspond to Fed purchase waves (2009–2010 QE1, 2020 QE4), benefiting big states most. The Fed’s MBS buys surged in 2009–2010 and again in 2020, then tapered. California’s bar dwarfs others, especially in those waves – visually confirming it as a hub. New York, Illinois, Texas, and Florida also contribute large chunks. Many smaller states and territories appear as tiny slivers. 
+```{r}
+library(ggplot2)
+library(scales)
+ggplot(state_year, aes(x = Total_UPB,
+               y = reorder(State, Total_UPB))) +
+  geom_col(fill = "steelblue") +
+  # convert raw dollars → billions and add “B” suffix
+  scale_x_continuous(
+    labels = label_number(
+      scale    = 1e-9,
+      suffix   = "B",
+      accuracy = 0.1
+    ),
+    name = "Unpaid Principal Balance (USD billions)"
+  ) +
+  labs(title = "Total UPB by State, 2009–2023", y = "State") +
+  facet_wrap(~ Year, ncol = 5, scales = "free_x") +
+  theme_minimal(base_size = 10) +
+  theme(
+    strip.text   = element_text(size = 5),
+    axis.text.y  = element_text(size = 2),
+    plot.title   = element_text(hjust = 0.5)
+  )
+
+```
+
+
+```{r}
+library(ggplot2)
+# Filter data for top 5 states and plot
+state_year_top5 <- state_year %>% filter(State %in% top_states)
+ggplot(state_year_top5, aes(x=Year, y=Total_UPB/1e9, color=State)) +
+  geom_line(size=1) + geom_point(size=2) +
+  labs(title="Aggregate UPB of Loans by State Over Time (Top 5 States)", 
+       x="Year of Purchase", y="Total UPB (billion USD)") +
+  theme_minimal()
+
+```
+**What about holding periods?** The Fed doesn’t hold MBS forever; many were sold or repaid. The distribution of holding days (for transactions that ended) is:
+
+```{r}
+# Calculate holding period (days) for each purchase
+data <- data %>% mutate(HoldingDays = as.numeric(`Sale Date` - `Purchase Date`))
+summary(data$HoldingDays)
+# Plot distribution of holding periods
+ggplot(data, aes(x=HoldingDays)) +
+  geom_histogram(binwidth=180, fill="skyblue", color="black") +
+  geom_vline(xintercept=mean(data$HoldingDays, na.rm=TRUE), color="red", linetype="dashed") +
+  geom_vline(xintercept=median(data$HoldingDays, na.rm=TRUE), color="darkgreen", linetype="dashed") +
+  labs(title="Distribution of CUSIP Holding Periods", x="Holding Period (days)", y="Number of CUSIPs") +
+  theme_minimal()
+
+```
+
+On average the Fed held an MBS ~3.3 years (1201 days) – but with huge variance (some under a month, some over 13 years). About 5,096 purchases were still held as of our data end (NA sale date). The red line marks the mean, green the median: Distribution of CUSIP Holding Periods. Most MBS were held 1–4 years. The mean (red) is higher due to a long tail of MBS the Fed held for 10+ years (often because borrowers didn’t refinance)​ The median (green) ~721 days.
+```{r}
+# Average holding period by state
+state_holdings <- state_upb_long %>%
+  filter(UPB > 0) %>%
+  select(CUSIP, State) %>%
+  distinct() %>%
+  left_join(data %>% select(CUSIP, HoldingDays), by="CUSIP") %>%
+  group_by(State) %>%
+  summarize(AvgHoldingDays = mean(HoldingDays, na.rm=TRUE), .groups="drop") %>%
+  arrange(AvgHoldingDays)
+head(state_holdings, 5)   # 5 states with shortest average holding period
+tail(state_holdings, 5)   # 5 states with longest average holding period
+
+```
+
+```{r}
+# For each CUSIP, compute the maximum state percentage
+cusip_exposure <- cusip_composition %>%
+  group_by(CUSIP) %>%
+  summarize(Max_Percent = max(Percent_State_UPB, na.rm = TRUE), .groups = "drop")
+
+# Merge the exposure data with the holding period information
+cusip_exposure <- cusip_exposure %>%
+  left_join(data_filtered %>% select(CUSIP, HoldingDays), by = "CUSIP") %>%
+  mutate(Exposure = if_else(Max_Percent > 50, "Concentrated", "Diverse"))
+
+# Check summary
+summary(cusip_exposure)
+
+```
+
+```{r}
+ggplot(cusip_exposure, aes(x = Exposure, y = HoldingDays, fill = Exposure)) +
+  geom_boxplot() +
+  labs(title = "Holding Period by UPB Exposure Concentration",
+       x = "Exposure Type",
+       y = "Holding Period (days)") +
+  theme_minimal()
+```
+Now the fun part: connecting states into a network graph. We create a bipartite incidence matrix incidence_mat of size (States × CUSIPs) where each cell is the percentage of that MBS’s UPB from that state​ For example, if Security X has 50% California loans, incidence_mat["California", "X"]=50. Using the bipartite R package, we treat this as a two-mode network​
+```{r}
+
+# 1) Build a small long‐format df with only positive %UPB
+mbs_web_df <- cusip_composition%>%
+  filter(Percent_State_UPB > 0) %>%
+  select(State, CUSIP, Percent_State_UPB)
+
+# 2) If you want exactly the same "gf" grouping, add it here (though acast doesn't use it):
+mbs_web_df$grouping_factor <- "gf"
+
+# 3) Use acast() to pivot to a matrix: rows = States, cols = CUSIPs
+incidence_mat <- acast(
+  mbs_web_df,
+  State   ~ CUSIP,
+  value.var  = "Percent_State_UPB",
+  fun.aggregate = sum,
+  fill         = 0
+)
+
+# 4) Coerce to "web" so plotweb() does CA under the hood
+class(incidence_mat) <- c("web", class(incidence_mat))
+
+# 5) Define your palette exactly as in the Women example
+cols1 <- c(
+  '#8dd3c7','#ffffb3','#bebada','#fb8072',
+  '#80b1d3','#fdb462','#b3de69','#fccde5',
+  '#d9d9d9','#bc80bd','#ccebc5','#ffed6f'
+)
+
+# 6) Plot the bipartite graph with correspondence‐analysis layout, included image because plotting takes a while
+#plotweb(
+#  incidence_mat,        # our State×CUSIP %UPB matrix
+#  method            = "cca",   # same as the women example
+##  labsize           = 1,
+#  text.rot          = 90,
+#  col.interaction   = cols1,
+#  bor.col.interaction = cols1
+#)
+#title("Full")
+
+```
+
+```{r, echo=FALSE, fig.align='center', out.width='50%'}
+knitr::include_graphics("plot_finalproj.png")
+
+```
+
+In the chunk above, I first used acast() to build incidence_mat, a matrix with rows = States and columns = CUSIPs, whose entries are the percent of unpaid principal balance (UPB) contributed by each state to each security. I then coerced that matrix to class "web" and called, plotweb( incidence_mat, method="cca", … )
+which runs a Correspondence Analysis (CA) on these weighted link values. 
+
+Because we pass the actual % UPB into CA, securities that draw their balances from very similar state mixes are placed close together in the ordination, and likewise for states that have similar exposure profiles.
+
+From the plot we can see major hubs like California and New York are noticiable by the extremely dense fans of lines radiating upward at their tick marks showing how they dominate many securities. Sub‑clusters of states (e.g. Midwest vs. Pacific vs. Northeast) whose line‑bundles overlap in similar regions, indicating geographic or market‐style groupings.Outlier territories (Guam, Puerto Rico) with only a few thin lines off to the side, reflecting their minimal footprint in the Fed’s MBS holdings.
+
+```{r}
+
+# 0) Restrict to Concentrated CUSIPs and build binary long table
+conc_ids <- cusip_exposure %>%
+  filter(Exposure == "Concentrated") %>%
+  pull(CUSIP)
+
+mbs_data_bin <- state_upb_long %>%
+  filter(UPB > 0, CUSIP %in% conc_ids) %>%
+  mutate(
+    State           = as.character(State),
+    CUSIP           = as.character(CUSIP),
+    grouping_factor = "gf"               # dummy factor
+  ) %>%
+  select(State, CUSIP, grouping_factor)
+
+# 1) Build the bipartite object on the full binary table
+mbs_web_conc <- frame2webs(
+  mbs_data_bin,
+  varnames  = c("State", "CUSIP", "grouping_factor"),
+  type.out  = "list",
+  emptylist = TRUE
+)
+
+# 2) Extract & coerce the matrix
+web_mat_conc <- mbs_web_conc$gf
+#lass(web_mat_conc) <- c("web", class(web_mat_conc))
+
+# 3) Define the 12‑color palette
+cols1 <- c(
+  '#8dd3c7','#ffffb3','#bebada','#fb8072',
+  '#80b1d3','#fdb462','#b3de69','#fccde5',
+  '#d9d9d9','#bc80bd','#ccebc5','#ffed6f'
+)
+
+# 4) Plot with correspondence‐analysis layout
+plotweb(
+  web_mat_conc,
+  method            = "cca",
+  labsize           = 1,
+  x.lim             = c(0, 3.45),
+  y.lim             = c(-0.2, 2.2),
+  text.rot          = 90,
+  col.interaction   = cols1,
+  bor.col.interaction = cols1
+)
+title("Full Concentrated CUSIPs Network (Binary Presence)")
+
+```
+
+
+```{r}
+exposed <- cusip_exposure %>% left_join(cusip_composition, by = "CUSIP")
+```
+
+```{r}
+library(dplyr)
+library(reshape2)   # for acast()
+library(bipartite)  # for plotweb()
+
+# 1) Grab only Concentrated CUSIPs with their %UPB weights
+wt_df <- exposed %>%
+  filter(Exposure == "Concentrated", Percent_State_UPB > 0) %>%
+  rename(
+    State  = State,                         # keep the State column
+    CUSIP  = CUSIP,                         # keep the CUSIP column
+    weight = Percent_State_UPB              # our numeric link weight
+  ) %>%
+  select(State, CUSIP, weight)
+
+# 2) Pivot to a matrix: rows = States, cols = CUSIPs, entries = weight
+wt_mat <- acast(
+  wt_df,
+  State ~ CUSIP,
+  value.var     = "weight",
+  fun.aggregate = sum,     # in case any dupes
+  fill          = 0        # empty slots = 0
+)
+
+# 3) Give it the “web” class so plotweb() knows what to do
+class(wt_mat) <- c("web", class(wt_mat))
+
+# 4) (Optionally) scale your link‐widths
+link_w <- wt_mat / max(wt_mat)             # between 0 and 1
+link_w <- 0.5 + 2.5 * link_w               # now in [0.5,3]
+
+# 5) Pick a color for all links
+link_col <- "steelblue"
+
+# 6) Plot the weighted bipartite we
+# 1) Create an igraph from your weighted incidence matrix
+g_bi <- graph_from_incidence_matrix(wt_mat, weighted = TRUE)
+
+# 2) Separate States (type=FALSE) vs. CUSIPs (type=TRUE)
+V(g_bi)$color <- ifelse(V(g_bi)$type, "tomato", "skyblue")
+V(g_bi)$size  <- ifelse(V(g_bi)$type, 4, 2)
+
+# 3) Plot with variable edge widths
+plot(
+  g_bi,
+  layout       = layout_as_bipartite(g_bi),
+  vertex.label = NA,
+  edge.width   = E(g_bi)$weight / max(E(g_bi)$weight) * 3,
+  edge.color   = "grey60",
+  main         = "Weighted Bipartite: States ↔ Concentrated CUSIPs"
+)
+legend(
+  "topleft",
+  legend = c("CUSIP","State"),
+  pch    = 21,
+  pt.bg  = c("tomato","skyblue"),
+  pt.cex = 2,
+  bty    = "n"
+)
+
+
+```
+
+
+```{r}
+library(igraph)
+
+# 1) Reconstruct the bipartite igraph directly from the weighted incidence matrix
+#    wt_mat is your State×CUSIP matrix of Percent_State_UPB
+g_bip <- graph_from_incidence_matrix(
+  wt_mat,
+  weighted = TRUE,    # preserve weights
+  mode     = "all"    # makes an undirected bipartite graph
+)
+
+# Sanity-check: bipartite types
+# FALSE = “row” nodes (States), TRUE = “column” nodes (CUSIPs)
+table(V(g_bip)$type)
+
+# 2) Project to the CUSIP–CUSIP network, summing co-occurrences
+projs   <- bipartite_projection(g_bip, multiplicity = TRUE)
+g_cusip <- projs$proj2     # by default proj2 are the “column” (CUSIP) nodes
+```
+
+```{r}
+# 3) Compute un‐weighted degree **via igraph** and grab the top 100
+deg    <- sort( igraph::degree(g_cusip), decreasing = TRUE )
+top100 <- names(deg)[ seq_len(min(100, length(deg))) ]
+
+# 4) Get their numeric vertex IDs and induce subgraph
+vids100 <- match(top100, V(g_cusip)$name)
+g_top   <- igraph::induced_subgraph(g_cusip, vids100)
+
+# 5) Layout + plot
+lay <- igraph::layout_with_fr(g_top)
+
+plot(
+  g_top,
+  layout       = lay,
+  vertex.size  = 5 + 5 * (igraph::degree(g_top) / max(igraph::degree(g_top))),
+  vertex.color = "tomato",
+  vertex.label = NA,
+  edge.width   = E(g_top)$weight / max(E(g_top)$weight) * 2,
+  edge.color   = "gray80",
+  main         = "Top 100 Concentrated CUSIPs by Unweighted Degree"
+)
+
+```
+
+```{r}
+library(igraph)
+
+# g_bi from before:
+g_bi <- graph_from_incidence_matrix(wt_mat, weighted = TRUE)
+
+# project to get state‐state graph:
+projs <- bipartite_projection(g_bi, multiplicity = TRUE)
+g_states <- projs$proj2  # assuming 'proj2' are the FALSE‐type vertices = States
+
+# simplify/threshold to the top‐50 heaviest edges
+E(g_states)$weight <- E(g_states)$weight
+g_trim <- delete_edges(g_states, E(g_states)[weight < quantile(weight, .75)])
+
+# plot
+plot(
+  g_trim,
+  layout     = layout_with_fr,
+  edge.width = E(g_trim)$weight / max(E(g_trim)$weight) * 5,
+  vertex.size= 8,
+  vertex.label.cex=0.8,
+  vertex.color="skyblue",
+  edge.color= "grey60",
+  main="State–State Co‐Exposure Network\n(top 25% shared CUSIPs)"
+)
+
+```
+
+```{r}
+degreedistr(web_mat_conc, plot.it=TRUE, level="both")
+#networklevel(web_mat_conc)
+# Network‐level (only key metrics)
+net_conc <- networklevel(
+  web_mat_conc,
+  index    = c("connectance","nestedness"),
+  level    = "both",
+  weighted = TRUE
+)
+
+```
+
+To analyze state-to-state relations, we “project” the bipartite network to a one-mode state network, connecting states that share securities. Specifically, we compute a weighted adjacency matrix state_adj where entry (i,j) is the sum of products of state i’s and state j’s percentages in each security. This captures how strongly i and j are linked via common pools. In code:
+```{r}
+state_adj_conc <- web_mat_conc %*% t(web_mat_conc)
+g_state_conc   <- graph_from_adjacency_matrix(
+  state_adj_conc,
+  mode    = "undirected",
+  weighted= TRUE,
+  diag    = FALSE
+)
+```
+
+```{r}
+vcount(g_state_conc)                # number of nodes
+edge_density(g_state_conc)          # proportion of possible edges present
+#components(g_state_conc)            # connected components
+diameter(g_state_conc)              # longest shortest‐path
+transitivity(g_state_conc)          # global clustering coefficient
+
+```
+
+```{r}
+library(igraph)
+# 2.1  Cluster with the Louvain algorithm
+comm_louvain <- cluster_louvain(g_state_conc, weights = E(g_state_conc)$weight)
+
+# 2.2  How many communities?
+length(comm_louvain)
+# 2.3  Modularity score
+modularity(comm_louvain)
+
+```
+
+```{r}
+# assign membership as a vertex attribute
+V(g_state_conc)$community <- membership(comm_louvain)
+
+# pick a palette
+pal <- RColorBrewer::brewer.pal(max(V(g_state_conc)$community), "Set3")
+
+plot(
+  g_state_conc,
+  vertex.color   = pal[V(g_state_conc)$community],
+  vertex.label   = V(g_state_conc)$name,
+  vertex.size    = 5,
+  edge.width     = 0.5,
+  edge.color     = "grey80",
+  main           = paste0("Louvain Communities (Q=", round(modularity(comm_louvain), 3),")")
+)
+
+```
+We found about 5 state communities. Modularity Q ≈ 0.28, meaning the network has a meaningful but not extreme community structure (0.28 indicates more clustering than random​ Plotting the network with nodes colored by community gave this result: Louvain Communities of State Network (Q=0.279). Puerto Rico stands isolated, as do a few other territories (Guam, Virgin Islands). The main continental U.S. clusters densely in the bottom-right blob (labels overlap due to graph density). This visualization (while cluttered) suggests Puerto Rico doesn’t share MBS with others forming its own one-node “community.”
+```{r}
+# keep only strong links
+g_thresh <- delete_edges(
+  g_state_conc,
+  E(g_state_conc)[ weight < 5 ]   # e.g. fewer than 5 shared CUSIPs
+)
+
+```
+
+Interpreting the clusters: states tend to group by region. In our analysis, we observed: a Pacific/West cluster (CA, HI, AZ, NV, etc.), a Northeast cluster (NY, NJ, MA, PA, etc.), a Midwest cluster (IL, OH, MI, WI, etc.), a Southern cluster (FL, GA, AL, MS, etc.), and a Mountain/Plains cluster (TX, CO, KS, etc.). These align with known regional lending patterns. Mortgages in the same MBS often come from either geographically proximate states or states with similar loan programs (e.g., many rural states might share government-loan pools). 
+
+```{r}
+library(igraph)
+# 2.1  Cluster with the Louvain algorithm
+comm_louvain1 <- cluster_louvain(g_thresh, weights = E(g_state_conc)$weight)
+
+# 2.2  How many communities?
+length(comm_louvain1)
+# 2.3  Modularity score
+modularity(comm_louvain1)
+
+```
+
+```{r}
+sizes(comm_louvain1)
+membership(comm_louvain1)
+
+```
+Hubs and connectivity: California sits at the center of the West cluster, connected to many states (because pools nationwide often include some California loans – CA has a huge volume). New York similarly anchors the Northeast cluster. These hubs are the high-degree nodes we expected​Smaller states like Puerto Rico or Guam ended up nearly isolated – the Fed did hold some PR loans, but those securities contained almost no other states’ loans, leaving PR with few connections (only minimal links where PR loans co-occurred with, say, one or two other places in a pool). In fact, PR’s isolation in the graph above (the lone blue “Puerto Rico” node) confirms it rarely shares MBS with the mainland. Puerto Rico and Guam formed their own micro-community, an intriguing finding, likely because mortgages in PR and Guam are often packaged separately (these territories have unique housing markets that investors treat as distinct (newyorkfed.org).
+```{r}
+# 1.1 Get the list of all CUSIPs in which Puerto Rico has any UPB
+pr_cusips <- cusip_composition %>%
+  filter(State == "Puerto Rico", UPB > 0) %>%
+  pull(CUSIP) %>%
+  unique()
+
+# 1.2 Extract their holding periods from the main data
+pr_holdings <- data %>%
+  filter(CUSIP %in% pr_cusips) %>%
+  select(CUSIP, `Purchase Date`, `Sale Date`, HoldingDays)
+
+# 1.3 Quick summary
+summary(pr_holdings$HoldingDays)
+# 1.4 Number of unique PR CUSIPs
+length(pr_cusips)
+
+```
+
+Results: State Connectivity and Outliers
+
+Our network analysis uncovers a few key insights:
+Regional Clusters: States cluster by geography in the Fed’s MBS network. The Fed’s portfolio effectively linked together neighboring or economically similar states more often​
+This suggests MBS pools often comprise regionally concentrated loans (perhaps due to lenders packaging nearby loans together). For example, our Louvain algorithm found a distinct Midwest community, separate from a coastal community – reminiscent of how social networks have cohesive subgroups.
+
+Dominant Hubs: A few large states are connected to nearly everyone. California’s mortgages appear in a huge number of Fed MBS, tying CA to 46 other states (by our unweighted measure). New York isn’t far behind. In network terms, these hubs have high degree and weight – the Fed’s support was broadest for mortgages from these states, giving them many “neighbors” in the network. Such hub-and-spoke structure is common in affiliation networks
+
+ (here, California is the “Hollywood” of mortgages – co-starring with almost every other state in some MBS!). This hub phenomenon yields a heavy-tailed connection distribution, which network scientists interpret as a sign of heterogeneity (few nodes with disproportionately many links)​
+
+Peripheral Outliers: Puerto Rico (and Guam, etc.) form tiny spokes barely attached to the network. Puerto Rico loans rarely co-mingled with mainland loans​
+
+Essentially, when the Fed bought pools of Puerto Rican mortgages, those pools were almost entirely PR-based (e.g., a Ginnie Mae pool of PR FHA loans). So PR stands alone, a nearly isolated node. In community detection, PR ended up in its own one-state community​This minimal footprint in the Fed’s MBS holdings reflects how niche PR’s mortgage market is relative to the broader US​ From a policy view, one could say Fed support didn’t diffuse into PR’s network – it was self-contained.
+
+Holding Periods vs Concentration: We noticed that MBS heavily concentrated in one state (like PR pools) tended to be held longer by the Fed. Puerto Rico is an extreme case: the Fed held its PR MBS an average of ~5.8 years, far above the overall median 2 years​
+
+In general, our data showed Concentrated pools (>50% in one state) had somewhat longer holding periods than Diverse pools (we confirmed this with a boxplot analysis, which showed a higher median for concentrated pools). One explanation: highly localized pools (especially from weaker economies) prepay slower (homeowners less often refinance or move), leaving the Fed holding the bag longer.
+
+This project is a glimpse of how blending data science, network theory, and domain knowledge can yield insights. The Fed’s actions, though national in scope, had a spatial imprint. Visualizing that as a network makes the intangible (like $1.7 trillion of support (ginniemae.gov) more concrete: you can see which states were pulled together by the safety net and which dangled alone. For policymakers, this underscores that broad interventions may still have uneven regional outcomes. For network scientists, it’s a case study in bipartite community detection in a real financial system.
+
