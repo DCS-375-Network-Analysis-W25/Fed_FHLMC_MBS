@@ -1,0 +1,372 @@
+---
+title: "cleaning_and_visuals"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#store string containing all required packages
+my_packages <- c('rtweet', 'ggplot2', 'igraph', 'RColorBrewer', 'readr', 'bipartite')
+```
+
+Figure out which of these packages is already installed
+``` {r, message=F, warning=F}
+# Store all installed packages
+ya_installed <- library()$results[,1]
+
+# Check whether required packages are already installed and grab only those that still need installation
+need_install<-my_packages[!(my_packages %in% ya_installed)]
+
+#install required packages
+lapply({need_install}, install.packages, character.only = TRUE)
+
+```
+
+
+``` {r, message=F, warning=F}
+# Store all installed packages
+ya_loaded <- (.packages())
+
+# Check whether required packages are already installed and grab only those that still need installation
+need_load<-my_packages[!(my_packages %in% ya_loaded)]
+
+# Load required packages
+lapply(need_load, require, character.only = TRUE)
+
+#also load the readr library
+library(readr)
+library(bipartite)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(igraph)
+library(reshape2)
+
+```
+
+```{r}
+# Load data (all columns read as characters initially)
+data <- read_csv("org_full_time_series.csv", col_types = cols(.default = col_character()))
+
+data <- data %>% select(-c(228,229,230,231))
+
+# Convert numeric columns (e.g., UPB, face values, etc.) by removing "$" and ","
+numeric_cols <- names(data)[7:ncol(data)]  # assuming numeric data start from column 7
+data[numeric_cols] <- data[numeric_cols] %>% 
+  mutate(across(everything(), ~parse_number(.)))
+
+# Merge duplicate DC columns if present
+if("District Of Columbia_Aggregate_UPB" %in% names(data)) {
+  data <- data %>%
+    mutate(`District of Columbia_Aggregate_UPB` = coalesce(`District of Columbia_Aggregate_UPB`, `District Of Columbia_Aggregate_UPB`),
+           `District of Columbia_Percent_UPB` = coalesce(`District of Columbia_Percent_UPB`, `District Of Columbia_Percent_UPB`),
+           `District of Columbia_Number_of_Loans` = coalesce(`District of Columbia_Number_of_Loans`, `District Of Columbia_Number_of_Loans`),
+           `District of Columbia_Percent_Loans` = coalesce(`District of Columbia_Percent_Loans`, `District Of Columbia_Percent_Loans`)) %>%
+    select(-starts_with("District Of Columbia_"))
+}
+
+# Convert date columns to Date type
+data <- data %>%
+  mutate(`Purchase Date` = as.Date(`Purchase Date`),
+         `Sale Date` = as.Date(`Sale Date`))
+         
+# Create HoldingDays variable (difference between Sale Date and Purchase Date)
+data <- data %>% mutate(HoldingDays = as.numeric(`Sale Date` - `Purchase Date`))
+
+# Peek at the data structure
+glimpse(data)
+
+```
+
+```{r}
+data_filtered <- data %>%
+  filter(year(`Purchase Date`) %in% c(2009:2012, 2019:2022))
+```
+
+```{r}
+# Reshape state-level UPB columns to long format
+state_upb_long <- data_filtered %>%
+  select(CUSIP, `Purchase Date`, ends_with("_Aggregate_UPB")) %>%
+  pivot_longer(
+    cols = ends_with("_Aggregate_UPB"),
+    names_to = "State",
+    names_pattern = "(.*)_Aggregate_UPB",
+    values_to = "UPB"
+  ) %>%
+  mutate(UPB = as.numeric(UPB),
+         Year = year(`Purchase Date`)) %>%
+  filter(!is.na(Year))
+
+# Compute total UPB per CUSIP (summing across all states)
+cusip_totals <- state_upb_long %>%
+  group_by(CUSIP) %>%
+  summarize(Total_UPB = sum(UPB, na.rm = TRUE), .groups = "drop")
+
+# Merge total UPB back and calculate percentage per state
+cusip_composition <- state_upb_long %>%
+  left_join(cusip_totals, by = "CUSIP") %>%
+  mutate(Percent_State_UPB = if_else(Total_UPB > 0, 100 * UPB / Total_UPB, 0))
+
+```
+
+```{r}
+# For each CUSIP, compute the maximum state percentage
+cusip_exposure <- cusip_composition %>%
+  group_by(CUSIP) %>%
+  summarize(Max_Percent = max(Percent_State_UPB, na.rm = TRUE), .groups = "drop")
+
+# Merge the exposure data with the holding period information
+cusip_exposure <- cusip_exposure %>%
+  left_join(data_filtered %>% select(CUSIP, HoldingDays), by = "CUSIP") %>%
+  mutate(Exposure = if_else(Max_Percent > 50, "Concentrated", "Diverse"))
+
+# Check summary
+summary(cusip_exposure)
+
+```
+
+```{r}
+ggplot(cusip_exposure, aes(x = Exposure, y = HoldingDays, fill = Exposure)) +
+  geom_boxplot() +
+  labs(title = "Holding Period by UPB Exposure Concentration",
+       x = "Exposure Type",
+       y = "Holding Period (days)") +
+  theme_minimal()
+```
+
+```{r}
+
+#Build a small long‐format df with only positive %UPB
+mbs_web_df <- cusip_composition%>%
+  filter(Percent_State_UPB > 0) %>%
+  select(State, CUSIP, Percent_State_UPB)
+
+mbs_web_df$grouping_factor <- "gf"
+
+#Use acast() to pivot to a matrix: rows = States, cols = CUSIPs
+incidence_mat <- acast(
+  mbs_web_df,
+  State   ~ CUSIP,
+  value.var  = "Percent_State_UPB",
+  fun.aggregate = sum,
+  fill         = 0
+)
+
+#Coerce to "web" so plotweb() does CA under the hood
+class(incidence_mat) <- c("web", class(incidence_mat))
+
+
+cols1 <- c(
+  '#8dd3c7','#ffffb3','#bebada','#fb8072',
+  '#80b1d3','#fdb462','#b3de69','#fccde5',
+  '#d9d9d9','#bc80bd','#ccebc5','#ffed6f'
+)
+
+#Plot the bipartite graph with correspondence‐analysis layout
+plotweb(
+  incidence_mat,        # our State×CUSIP %UPB matrix
+  method            = "cca",   # same as the women example
+  labsize           = 1,
+  text.rot          = 90,
+  col.interaction   = cols1,
+  bor.col.interaction = cols1
+)
+
+```
+
+In the chunk above, I first used acast() to build incidence_mat, a matrix with rows = States and columns = CUSIPs, whose entries are the percent of unpaid principal balance (UPB) contributed by each state to each security. I then coerced that matrix to class "web" and called, plotweb( incidence_mat, method="cca", … )
+which runs a Correspondence Analysis (CA) on these weighted link values. 
+
+Because we pass the actual % UPB into CA, securities that draw their balances from very similar state mixes are placed close together in the ordination, and likewise for states that have similar exposure profiles.
+
+From the plot we can see major hubs like California and New York are noticiable by the extremely dense fans of lines radiating upward at their tick marks showing how they dominate many securities. Sub‑clusters of states (e.g. Midwest vs. Pacific vs. Northeast) whose line‑bundles overlap in similar regions, indicating geographic or market‐style groupings.Outlier territories (Guam, Puerto Rico) with only a few thin lines off to the side, reflecting their minimal footprint in the Fed’s MBS holdings.
+
+```{r}
+# Concentrated weighted web
+conc_ids <- cusip_exposure %>% filter(Exposure=="Concentrated") %>% pull(CUSIP)
+inc_mat_conc <- acast(
+  cusip_composition     %>% filter(CUSIP %in% conc_ids & Percent_State_UPB>0),
+  State ~ CUSIP,
+  value.var = "Percent_State_UPB",
+  fun.aggregate = sum,
+  fill = 0
+)
+class(inc_mat_conc) <- c("web","matrix")
+```
+
+```{r}
+library(bipartite)
+
+# Concentrated
+net_conc_w <- networklevel(
+  inc_mat_conc,
+  index    = c("connectance","nestedness","robustness"),
+  level    = "both",
+  weighted = TRUE
+)
+grp_conc_w <- grouplevel(
+  inc_mat_conc,
+  level    = "both",
+  weighted = TRUE
+)
+sp_conc_w  <- specieslevel(
+  inc_mat_conc,
+  level    = "both",
+  weighted = TRUE
+)
+```
+
+```{r}
+library(igraph)
+
+# State–state for concentrated, weighted by sum of %UPB overlaps
+g_conc_w <- graph_from_adjacency_matrix(
+  inc_mat_conc %*% t(inc_mat_conc),
+  mode="undirected", weighted=TRUE, diag=FALSE
+)
+# Now compute weighted density, clustering, etc.
+edge_density(g_conc_w)                      # weighted density ≈ connectance
+transitivity(g_conc_w, type="global")       # weighted clustering
+vcount(g_conc_w)                        # number of states                # number of 
+diameter(g_conc_w, weights=NA)
+```
+
+Calculate statistics for the diverse web. 
+```{r}
+# Diverse weighted web
+div_ids  <- cusip_exposure %>% filter(Exposure=="Diverse")    %>% pull(CUSIP)
+inc_mat_div  <- acast(
+  cusip_composition     %>% filter(CUSIP %in% div_ids & Percent_State_UPB>0),
+  State ~ CUSIP,
+  value.var = "Percent_State_UPB",
+  fun.aggregate = sum,
+  fill = 0
+)
+class(inc_mat_div) <- c("web","matrix")
+
+```
+
+```{r}
+library(bipartite)
+
+# Concentrated
+net_div_w <- networklevel(
+  inc_mat_div,
+  index    = c("connectance","nestedness","robustness"),
+  level    = "both",
+  weighted = TRUE
+)
+grp_div_w <- grouplevel(
+  inc_mat_div,
+  level    = "both",
+  weighted = TRUE
+)
+sp_div_w  <- specieslevel(
+  inc_mat_div,
+  level    = "both",
+  weighted = TRUE
+)
+```
+
+```{r}
+library(igraph)
+
+# State–state for concentrated, weighted by sum of %UPB overlaps
+g_div_w <- graph_from_adjacency_matrix(
+  inc_mat_div %*% t(inc_mat_div),
+  mode="undirected", weighted=TRUE, diag=FALSE
+)
+# Now compute weighted density, clustering, etc.
+edge_density(g_div_w)                      # weighted density ≈ connectance
+transitivity(g_div_w, type="global")       # weighted clustering
+vcount(g_div_w)                        # number of states                # number of 
+diameter(g_div_w, weights=NA)
+```
+
+```{r}
+library(dplyr)
+library(reshape2)
+library(bipartite)
+
+# 12‐color palette
+cols1 <- c(
+  '#8dd3c7','#ffffb3','#bebada','#fb8072',
+  '#80b1d3','#fdb462','#b3de69','#fccde5',
+  '#d9d9d9','#bc80bd','#ccebc5','#ffed6f'
+)
+
+# --- A) Concentrated web ---
+incidence_mat_conc <- cusip_composition %>%
+  # bring in the Exposure label
+  inner_join(
+    cusip_exposure %>% select(CUSIP, Exposure),
+    by = "CUSIP"
+  ) %>%
+  filter(Exposure == "Concentrated", Percent_State_UPB > 0) %>%
+  acast(
+    State ~ CUSIP,
+    value.var     = "Percent_State_UPB",
+    fun.aggregate = sum,
+    fill          = 0
+  )
+
+class(incidence_mat_conc) <- c("web", class(incidence_mat_conc))
+
+plotweb(
+  incidence_mat_conc,
+  method            = "cca",
+  labsize           = 1,
+  text.rot          = 90,
+  col.interaction   = cols1,
+  bor.col.interaction = cols1,
+)
+title("Concentrated CUSIPs (Weighted %UPB)")
+```
+
+
+```{r}
+library(dplyr)
+library(bipartite)
+
+set.seed(123)
+
+# 1) Pick a random subset of States and CUSIPs
+all_states  <- rownames(inc_mat_div)
+all_cusips  <- colnames(inc_mat_div)
+
+# here I sample 25 states and 80 CUSIPs (tune as needed)
+sample_states_div <- sample(all_states, 53)
+sample_cusips_div <- sample(all_cusips, 100)
+
+# 2) Subset the full matrix
+sub_div_mat <- inc_mat_div[sample_states_div, sample_cusips_div, drop = FALSE]
+
+# 3) Coerce to "web" class
+class(sub_div_mat) <- c("web", class(sub_div_mat))
+
+# 4) Define the same 12‑color palette
+cols1 <- c(
+  '#8dd3c7','#ffffb3','#bebada','#fb8072',
+  '#80b1d3','#fdb462','#b3de69','#fccde5',
+  '#d9d9d9','#bc80bd','#ccebc5','#ffed6f'
+)
+
+# 5) Plot with CA layout on the sampled submatrix
+plotweb(
+  sub_div_mat,
+  method            = "cca",
+  labsize           = 1,
+  text.rot          = 90,
+  col.interaction   = cols1,
+  bor.col.interaction = cols1
+)
+title("Diverse CUSIPs (Weighted %UPB) — Sampled Subnetwork")
+
+```
+
+
+
